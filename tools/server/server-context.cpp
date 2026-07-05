@@ -2613,8 +2613,31 @@ private:
                         break;
                     }
                     tokens.resize(token_count);
+
+                    // Verify the KV cache was actually populated at the expected positions.
+                    // A mismatch (pos_max != token_count-1) typically means the context has
+                    // insufficient space, or the save file was produced by a server with different
+                    // --cache-type-k / --cache-type-v settings (must be identical for cross-machine
+                    // disaggregated prefill/decode to work correctly).
+                    if (token_count > 0 && llama_get_memory(ctx_tgt)) {
+                        const llama_pos kv_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
+                        if (kv_pos_max != (llama_pos)(token_count - 1)) {
+                            slot->prompt.tokens.clear();
+                            send_error(task,
+                                string_format("KV cache restore mismatch: expected pos_max=%zu but got %d. "
+                                              "Check that context size is large enough and that prefill/decode servers "
+                                              "use identical --cache-type-k / --cache-type-v settings.",
+                                              token_count - 1, (int)kv_pos_max),
+                                ERROR_TYPE_SERVER);
+                            break;
+                        }
+                    }
+
                     slot->prompt.tokens.clear();
                     slot->prompt.tokens.insert(tokens);
+
+                    SLT_INF(*slot, "restored %zu tokens from '%s' for disaggregated decode, KV positions 0..%zu valid\n",
+                            token_count, filename.c_str(), token_count > 0 ? token_count - 1 : 0);
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
