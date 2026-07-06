@@ -17,8 +17,11 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include <cpp-httplib/httplib.h>
+
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <cinttypes>
 #include <exception>
 #include <memory>
@@ -2603,6 +2606,147 @@ private:
                     res->n_erased = n_erased;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_SLOT_GET_STATE:
+                {
+                    if (!check_no_mtmd(task.id)) break;
+                    const int id_slot = task.slot_action.id_slot;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
+                    const size_t token_count = tokens.size();
+                    const size_t state_size = llama_state_seq_get_size(ctx_tgt, slot->id);
+
+                    // binary format: [uint32 token_count][int32[] token_ids][state blob]
+                    std::vector<uint8_t> buf(4 + token_count * 4 + state_size);
+                    uint32_t tc = (uint32_t)token_count;
+                    std::memcpy(buf.data(), &tc, 4);
+                    for (size_t i = 0; i < token_count; i++) {
+                        int32_t tok = tokens[i];
+                        std::memcpy(buf.data() + 4 + i * 4, &tok, 4);
+                    }
+                    size_t written = llama_state_seq_get_data(ctx_tgt, buf.data() + 4 + token_count * 4, state_size, slot->id);
+                    buf.resize(4 + token_count * 4 + written);
+
+                    auto res = std::make_unique<server_task_result_slot_get_state>();
+                    res->id       = task.id;
+                    res->id_slot  = id_slot;
+                    res->n_tokens = token_count;
+                    res->data     = std::move(buf);
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SLOT_PULL:
+                {
+                    if (!check_no_mtmd(task.id)) break;
+                    const int id_slot = task.slot_action.id_slot;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    const std::string & source_url = task.slot_action.source_url;
+                    const int source_slot = task.slot_action.source_slot;
+
+                    // parse "http://host:port" -> host, port
+                    std::string host;
+                    int port = 80;
+                    {
+                        const std::string pfx_http  = "http://";
+                        const std::string pfx_https = "https://";
+                        std::string rest;
+                        if (source_url.rfind(pfx_http, 0) == 0) {
+                            rest = source_url.substr(pfx_http.size());
+                        } else if (source_url.rfind(pfx_https, 0) == 0) {
+                            rest = source_url.substr(pfx_https.size());
+                            port = 443;
+                        } else {
+                            send_error(task, "source_url must start with http:// or https://", ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+                        auto slash = rest.find('/');
+                        if (slash != std::string::npos) rest = rest.substr(0, slash);
+                        auto colon = rest.rfind(':');
+                        if (colon != std::string::npos) {
+                            host = rest.substr(0, colon);
+                            port = std::stoi(rest.substr(colon + 1));
+                        } else {
+                            host = rest;
+                        }
+                    }
+
+                    // fetch state from source
+                    const int64_t t_start = ggml_time_us();
+                    httplib::Client cli(host, port);
+                    cli.set_connection_timeout(30);
+                    cli.set_read_timeout(300);
+                    std::string path = "/slots/" + std::to_string(source_slot) + "/state";
+                    auto http_res = cli.Get(path);
+                    if (!http_res || http_res->status != 200) {
+                        std::string msg = http_res
+                            ? "Source returned HTTP " + std::to_string(http_res->status)
+                            : "Failed to connect to source: " + host;
+                        send_error(task, msg, ERROR_TYPE_SERVER);
+                        break;
+                    }
+
+                    const std::string & body = http_res->body;
+                    if (body.size() < 4) {
+                        send_error(task, "Slot state response too short", ERROR_TYPE_SERVER);
+                        break;
+                    }
+
+                    uint32_t token_count;
+                    std::memcpy(&token_count, body.data(), 4);
+                    const size_t token_bytes = (size_t)token_count * 4;
+                    if (body.size() < 4 + token_bytes) {
+                        send_error(task, "Slot state response truncated (token header)", ERROR_TYPE_SERVER);
+                        break;
+                    }
+
+                    llama_tokens tokens((size_t)token_count);
+                    for (uint32_t i = 0; i < token_count; i++) {
+                        std::memcpy(&tokens[i], body.data() + 4 + i * 4, 4);
+                    }
+
+                    const uint8_t * state_data = reinterpret_cast<const uint8_t *>(body.data() + 4 + token_bytes);
+                    const size_t state_size = body.size() - 4 - token_bytes;
+                    size_t nread = llama_state_seq_set_data(ctx_tgt, state_data, state_size, slot->id);
+                    if (nread == 0) {
+                        slot->prompt.tokens.clear();
+                        send_error(task, "Failed to restore slot state: no available KV space or corrupt data", ERROR_TYPE_SERVER);
+                        break;
+                    }
+
+                    slot->prompt.tokens.clear();
+                    slot->prompt.tokens.insert(tokens);
+
+                    const int64_t t_end = ggml_time_us();
+                    const double t_ms = (t_end - t_start) / 1000.0;
+
+                    auto res = std::make_unique<server_task_result_slot_save_load>();
+                    res->id       = task.id;
+                    res->id_slot  = id_slot;
+                    res->filename = "";
+                    res->is_save  = false;
+                    res->n_tokens = (size_t)token_count;
+                    res->n_bytes  = nread;
+                    res->t_ms     = t_ms;
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_GET_LORA:
                 {
                     // TODO @ngxson : make lora_adapters a dedicated member of server_context
@@ -4460,12 +4604,23 @@ void server_routes::init_routes() {
         return res;
     };
 
-    this->post_slots = [this](const server_http_req & req) {
+    this->get_slots_state = [this](const server_http_req & req) {
         auto res = create_response();
-        if (params.slot_save_path.empty()) {
-            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
+
+        std::string id_slot_str = req.get_param("id_slot");
+        int id_slot;
+        try {
+            id_slot = std::stoi(id_slot_str);
+        } catch (const std::exception &) {
+            res->error(format_error_response("Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
+
+        return handle_slots_get_state(req, id_slot);
+    };
+
+    this->post_slots = [this](const server_http_req & req) {
+        auto res = create_response();
 
         std::string id_slot_str = req.get_param("id_slot");
 
@@ -4478,6 +4633,16 @@ void server_routes::init_routes() {
         }
 
         std::string action = req.get_param("action");
+
+        // pull does not use slot_save_path — check it first
+        if (action == "pull") {
+            return handle_slots_pull(req, id_slot);
+        }
+
+        if (params.slot_save_path.empty()) {
+            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
 
         if (action == "save") {
             return handle_slots_save(req, id_slot);
@@ -5165,6 +5330,79 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
     }
 
     GGML_ASSERT(dynamic_cast<server_task_result_slot_erase*>(result.get()) != nullptr);
+    res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_get_state(const server_http_req & req, int id_slot) {
+    auto res = create_response();
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_GET_STATE);
+        task.id = rd.get_new_id();
+        task.slot_action.id_slot = id_slot;
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    auto * typed = dynamic_cast<server_task_result_slot_get_state*>(result.get());
+    GGML_ASSERT(typed != nullptr);
+    res->content_type = "application/octet-stream";
+    res->status = 200;
+    res->data = std::string(typed->data.begin(), typed->data.end());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_pull(const server_http_req & req, int id_slot) {
+    auto res = create_response();
+
+    json request_data;
+    try {
+        request_data = json::parse(req.body);
+    } catch (const std::exception &) {
+        res->error(format_error_response("Invalid JSON body", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    if (!request_data.contains("source")) {
+        res->error(format_error_response("Missing required field: source", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    std::string source_url  = request_data.at("source");
+    int source_slot = request_data.value("source_slot", 0);
+
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_PULL);
+        task.id = rd.get_new_id();
+        task.slot_action.id_slot    = id_slot;
+        task.slot_action.source_url  = source_url;
+        task.slot_action.source_slot = source_slot;
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    GGML_ASSERT(dynamic_cast<server_task_result_slot_save_load*>(result.get()) != nullptr);
     res->ok(result->to_json());
     return res;
 }

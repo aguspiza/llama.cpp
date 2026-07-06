@@ -25,6 +25,8 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
+    SERVER_TASK_TYPE_SLOT_GET_STATE, // serialize slot state to binary (for disagg pull)
+    SERVER_TASK_TYPE_SLOT_PULL,      // fetch + restore slot state from a remote server
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
 };
@@ -161,11 +163,15 @@ struct server_task {
 
     server_task_type type;
 
-    // used by SERVER_TASK_TYPE_SLOT_SAVE, SERVER_TASK_TYPE_SLOT_RESTORE, SERVER_TASK_TYPE_SLOT_ERASE
+    // used by SERVER_TASK_TYPE_SLOT_SAVE, SERVER_TASK_TYPE_SLOT_RESTORE, SERVER_TASK_TYPE_SLOT_ERASE,
+    // SERVER_TASK_TYPE_SLOT_GET_STATE, SERVER_TASK_TYPE_SLOT_PULL
     struct slot_action {
         int id_slot;
         std::string filename;
         std::string filepath;
+        // for SLOT_PULL: URL of the prefill server and its slot ID
+        std::string source_url;
+        int source_slot = 0;
     };
     slot_action slot_action;
 
@@ -567,6 +573,15 @@ struct server_task_result_control : server_task_result {
         }
         return out;
     }
+};
+
+// result of SERVER_TASK_TYPE_SLOT_GET_STATE — carries raw binary state + token IDs
+struct server_task_result_slot_get_state : server_task_result {
+    int id_slot;
+    size_t n_tokens;
+    std::vector<uint8_t> data; // [uint32 token_count][int32[] token_ids][state blob]
+
+    virtual json to_json() override { return {}; } // not used; caller reads data directly
 };
 
 struct server_task_result_get_lora : server_task_result {
