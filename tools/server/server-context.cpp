@@ -24,6 +24,7 @@
 #include <cstring>
 #include <cinttypes>
 #include <exception>
+#include <fstream>
 #include <memory>
 #include <filesystem>
 #include <utility>
@@ -2621,20 +2622,23 @@ private:
                         break;
                     }
 
+                    // Serialize via save_file; temp path was set by the route handler via slot_action.filepath
+                    const std::string tmp_path = task.slot_action.filepath;
                     const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
                     const size_t token_count = tokens.size();
-                    const size_t state_size = llama_state_seq_get_size(ctx_tgt, slot->id);
-
-                    // binary format: [uint32 token_count][int32[] token_ids][state blob]
-                    std::vector<uint8_t> buf(4 + token_count * 4 + state_size);
-                    uint32_t tc = (uint32_t)token_count;
-                    std::memcpy(buf.data(), &tc, 4);
-                    for (size_t i = 0; i < token_count; i++) {
-                        int32_t tok = tokens[i];
-                        std::memcpy(buf.data() + 4 + i * 4, &tok, 4);
+                    const size_t nwrite = llama_state_seq_save_file(ctx_tgt, tmp_path.c_str(), slot->id,
+                                                                    tokens.data(), token_count);
+                    if (nwrite == 0) {
+                        send_error(task, "Failed to serialize slot state", ERROR_TYPE_SERVER);
+                        break;
                     }
-                    size_t written = llama_state_seq_get_data(ctx_tgt, buf.data() + 4 + token_count * 4, state_size, slot->id);
-                    buf.resize(4 + token_count * 4 + written);
+
+                    std::vector<uint8_t> buf(nwrite);
+                    {
+                        std::ifstream f(tmp_path, std::ios::binary);
+                        f.read(reinterpret_cast<char*>(buf.data()), (std::streamsize)nwrite);
+                    }
+                    std::filesystem::remove(tmp_path);
 
                     auto res = std::make_unique<server_task_result_slot_get_state>();
                     res->id       = task.id;
@@ -2693,8 +2697,8 @@ private:
                     httplib::Client cli(host, port);
                     cli.set_connection_timeout(30);
                     cli.set_read_timeout(300);
-                    std::string path = "/slots/" + std::to_string(source_slot) + "/state";
-                    auto http_res = cli.Get(path);
+                    std::string http_path = "/slots/" + std::to_string(source_slot) + "/state";
+                    auto http_res = cli.Get(http_path);
                     if (!http_res || http_res->status != 200) {
                         std::string msg = http_res
                             ? "Source returned HTTP " + std::to_string(http_res->status)
@@ -2703,34 +2707,28 @@ private:
                         break;
                     }
 
-                    const std::string & body = http_res->body;
-                    if (body.size() < 4) {
-                        send_error(task, "Slot state response too short", ERROR_TYPE_SERVER);
-                        break;
+                    // Write response bytes to a temp file and restore via load_file
+                    // (matches the llama_state_seq_save_file format with magic header)
+                    const std::string tmp_path = std::filesystem::temp_directory_path().string()
+                        + "/llama_pull_tmp_" + std::to_string(id_slot) + ".bin";
+                    {
+                        std::ofstream f(tmp_path, std::ios::binary);
+                        f.write(http_res->body.data(), (std::streamsize)http_res->body.size());
                     }
 
-                    uint32_t token_count;
-                    std::memcpy(&token_count, body.data(), 4);
-                    const size_t token_bytes = (size_t)token_count * 4;
-                    if (body.size() < 4 + token_bytes) {
-                        send_error(task, "Slot state response truncated (token header)", ERROR_TYPE_SERVER);
-                        break;
-                    }
+                    llama_tokens tokens;
+                    tokens.resize(slot->n_ctx);
+                    size_t token_count = 0;
+                    size_t nread = llama_state_seq_load_file(ctx_tgt, tmp_path.c_str(), slot->id,
+                                                             tokens.data(), tokens.size(), &token_count);
+                    std::filesystem::remove(tmp_path);
 
-                    llama_tokens tokens((size_t)token_count);
-                    for (uint32_t i = 0; i < token_count; i++) {
-                        std::memcpy(&tokens[i], body.data() + 4 + i * 4, 4);
-                    }
-
-                    const uint8_t * state_data = reinterpret_cast<const uint8_t *>(body.data() + 4 + token_bytes);
-                    const size_t state_size = body.size() - 4 - token_bytes;
-                    size_t nread = llama_state_seq_set_data(ctx_tgt, state_data, state_size, slot->id);
                     if (nread == 0) {
                         slot->prompt.tokens.clear();
-                        send_error(task, "Failed to restore slot state: no available KV space or corrupt data", ERROR_TYPE_SERVER);
+                        send_error(task, "Failed to restore slot state: no available KV space or incompatible state file", ERROR_TYPE_SERVER);
                         break;
                     }
-
+                    tokens.resize(token_count);
                     slot->prompt.tokens.clear();
                     slot->prompt.tokens.insert(tokens);
 
@@ -2742,7 +2740,7 @@ private:
                     res->id_slot  = id_slot;
                     res->filename = "";
                     res->is_save  = false;
-                    res->n_tokens = (size_t)token_count;
+                    res->n_tokens = token_count;
                     res->n_bytes  = nread;
                     res->t_ms     = t_ms;
                     queue_results.send(std::move(res));
@@ -4606,6 +4604,10 @@ void server_routes::init_routes() {
 
     this->get_slots_state = [this](const server_http_req & req) {
         auto res = create_response();
+        if (params.slot_save_path.empty()) {
+            res->error(format_error_response("This server does not support slot state endpoint. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
 
         std::string id_slot_str = req.get_param("id_slot");
         int id_slot;
@@ -5340,7 +5342,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_get_state(cons
     {
         server_task task(SERVER_TASK_TYPE_SLOT_GET_STATE);
         task.id = rd.get_new_id();
-        task.slot_action.id_slot = id_slot;
+        task.slot_action.id_slot  = id_slot;
+        // pass temp path via filepath field so the task handler (which has no params access) can use it
+        task.slot_action.filepath = params.slot_save_path + "_state_tmp_" + std::to_string(id_slot) + ".bin";
         rd.post_task(std::move(task));
     }
 
