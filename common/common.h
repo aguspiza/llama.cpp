@@ -642,6 +642,11 @@ struct common_params {
     std::string slot_save_path;
     std::string media_path; // path to directory for loading media files
 
+    // disaggregated prefill: offload prompt processing to a remote llama-server
+    std::string prefill_url;              // remote prefill server base URL (empty = disabled)
+    std::string prefill_state_url;        // where to GET /slots/:id/state (default: prefill_url)
+    int32_t     prefill_min_tokens = 200; // offload only when at least this many tokens are uncached
+
     float slot_prompt_similarity = 0.1f;
 
     // batched-bench params

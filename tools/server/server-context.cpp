@@ -1594,6 +1594,155 @@ private:
         return true;
     }
 
+    // parse "http(s)://host[:port][/...]" into host + port. returns false for other schemes.
+    static bool parse_http_host_port(const std::string & url, std::string & host, int & port) {
+        const std::string pfx_http  = "http://";
+        const std::string pfx_https = "https://";
+        std::string rest;
+        if (url.rfind(pfx_http, 0) == 0) {
+            rest = url.substr(pfx_http.size());
+            port = 80;
+        } else if (url.rfind(pfx_https, 0) == 0) {
+            rest = url.substr(pfx_https.size());
+            port = 443;
+        } else {
+            return false;
+        }
+        auto slash = rest.find('/');
+        if (slash != std::string::npos) rest = rest.substr(0, slash);
+        auto colon = rest.rfind(':');
+        if (colon != std::string::npos) {
+            host = rest.substr(0, colon);
+            port = std::stoi(rest.substr(colon + 1));
+        } else {
+            host = rest;
+        }
+        return true;
+    }
+
+    // fetch binary slot state from `source_url`'s GET /slots/:source_slot/state and restore
+    // it into `slot` (wire format = llama_state_seq_save_file). used by both the HTTP
+    // action=pull and the disaggregated-prefill path. returns an empty string on success,
+    // the error message on failure. the slot's sequence is cleared before restoring, so on
+    // failure the slot is left empty (the next prompt does a full local prefill).
+    std::string pull_slot_state(server_slot & slot, const std::string & source_url, int source_slot, size_t & n_tokens, size_t & n_bytes) {
+        std::string host;
+        int port = 80;
+        if (!parse_http_host_port(source_url, host, port)) {
+            return "source url must start with http:// or https://";
+        }
+
+        httplib::Client cli(host, port);
+        cli.set_connection_timeout(30);
+        cli.set_read_timeout(300);
+        const std::string http_path = "/slots/" + std::to_string(source_slot) + "/state";
+        auto http_res = cli.Get(http_path);
+        if (!http_res || http_res->status != 200) {
+            return http_res
+                ? "Source returned HTTP " + std::to_string(http_res->status)
+                : "Failed to connect to source: " + host;
+        }
+
+        // Write response bytes to a temp file and restore via load_file
+        // (matches the llama_state_seq_save_file format with magic header)
+        const std::string tmp_path = std::filesystem::temp_directory_path().string()
+            + "/llama_pull_tmp_" + std::to_string(slot.id) + ".bin";
+        {
+            std::ofstream f(tmp_path, std::ios::binary);
+            f.write(http_res->body.data(), (std::streamsize) http_res->body.size());
+        }
+
+        // start from a clean sequence: load_file does not clear pre-existing cells
+        slot.prompt_clear(true);
+
+        llama_tokens tokens;
+        tokens.resize(slot.n_ctx);
+        size_t token_count = 0;
+        size_t nread = llama_state_seq_load_file(ctx_tgt, tmp_path.c_str(), slot.id,
+                                                 tokens.data(), tokens.size(), &token_count);
+        std::filesystem::remove(tmp_path);
+
+        if (nread == 0) {
+            slot.prompt.tokens.clear();
+            return "Failed to restore slot state: no available KV space or incompatible state file";
+        }
+        tokens.resize(token_count);
+        slot.prompt.tokens.clear();
+        slot.prompt.tokens.insert(tokens);
+
+        n_tokens = token_count;
+        n_bytes  = nread;
+        return "";
+    }
+
+    // disaggregated prefill (--prefill-url): erase the remote slot, prefill the task's
+    // exact token IDs there (n_predict=0), and pull the computed state into `slot`.
+    // No re-render/re-tokenize happens on the remote, so the pulled state always matches
+    // this prompt. Returns true iff the state was pulled; on failure the caller falls
+    // back to local prefill (recompute the prefix — the slot may have been cleared).
+    bool disagg_remote_prefill(server_slot & slot) {
+        const int source_slot = 0; // both ends run -np 1 on slot 0
+
+        llama_tokens ids = slot.task->tokens.get_text_tokens();
+        // prefill up to N-4 so the hybrid/SSM checkpoint threshold accepts the restored
+        // state (pos_min = N-5 < pos_min_thold = N-4) and only 4 tokens re-evaluate here
+        if (ids.size() > 4) {
+            ids.resize(ids.size() - 4);
+        }
+
+        std::string host;
+        int port = 80;
+        if (!parse_http_host_port(params_base.prefill_url, host, port)) {
+            SLT_WRN(slot, "disagg: invalid --prefill-url '%s'\n", params_base.prefill_url.c_str());
+            return false;
+        }
+
+        const int64_t t_start = ggml_time_us();
+
+        httplib::Client cli(host, port);
+        cli.set_connection_timeout(10);
+        cli.set_read_timeout(600);
+
+        // 1) always erase the remote slot first: stale KV + recurrent/SSM state from a
+        //    previous request corrupts the prefill if reused
+        auto res_erase = cli.Post("/slots/" + std::to_string(source_slot) + "?action=erase");
+        if (!res_erase || res_erase->status != 200) {
+            SLT_WRN(slot, "disagg: remote erase failed (HTTP %d), falling back to local prefill\n",
+                    res_erase ? res_erase->status : -1);
+            return false;
+        }
+
+        // 2) prefill the exact token IDs remotely
+        const json body = {
+            {"prompt",       ids},
+            {"n_predict",    0},
+            {"cache_prompt", false},
+            {"id_slot",      source_slot},
+            {"stream",       false},
+        };
+        auto res_pf = cli.Post("/completion", body.dump(), "application/json");
+        if (!res_pf || res_pf->status != 200) {
+            SLT_WRN(slot, "disagg: remote prefill failed (HTTP %d), falling back to local prefill\n",
+                    res_pf ? res_pf->status : -1);
+            return false;
+        }
+
+        // 3) pull the computed state into this slot
+        const std::string & state_url = params_base.prefill_state_url.empty()
+            ? params_base.prefill_url : params_base.prefill_state_url;
+        size_t n_tokens = 0;
+        size_t n_bytes  = 0;
+        const std::string err = pull_slot_state(slot, state_url, source_slot, n_tokens, n_bytes);
+        if (!err.empty()) {
+            SLT_WRN(slot, "disagg: pull failed (%s), falling back to local prefill\n", err.c_str());
+            return false;
+        }
+
+        SLT_INF(slot, "disagg: remote prefill of %zu tokens pulled in %.2f s (%zu bytes)\n",
+                n_tokens, (ggml_time_us() - t_start) / 1e6, n_bytes);
+        return true;
+    }
+
     void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress) {
         auto res = std::make_unique<server_task_result_cmpl_partial>();
 
@@ -2176,86 +2325,26 @@ private:
                         break;
                     }
 
-                    const std::string & source_url = task.slot_action.source_url;
-                    const int source_slot = task.slot_action.source_slot;
-
-                    // parse "http://host:port" -> host, port
-                    std::string host;
-                    int port = 80;
-                    {
-                        const std::string pfx_http  = "http://";
-                        const std::string pfx_https = "https://";
-                        std::string rest;
-                        if (source_url.rfind(pfx_http, 0) == 0) {
-                            rest = source_url.substr(pfx_http.size());
-                        } else if (source_url.rfind(pfx_https, 0) == 0) {
-                            rest = source_url.substr(pfx_https.size());
-                            port = 443;
-                        } else {
-                            send_error(task, "source_url must start with http:// or https://", ERROR_TYPE_INVALID_REQUEST);
-                            break;
-                        }
-                        auto slash = rest.find('/');
-                        if (slash != std::string::npos) rest = rest.substr(0, slash);
-                        auto colon = rest.rfind(':');
-                        if (colon != std::string::npos) {
-                            host = rest.substr(0, colon);
-                            port = std::stoi(rest.substr(colon + 1));
-                        } else {
-                            host = rest;
-                        }
-                    }
-
-                    // fetch state from source
                     const int64_t t_start = ggml_time_us();
-                    httplib::Client cli(host, port);
-                    cli.set_connection_timeout(30);
-                    cli.set_read_timeout(300);
-                    std::string http_path = "/slots/" + std::to_string(source_slot) + "/state";
-                    auto http_res = cli.Get(http_path);
-                    if (!http_res || http_res->status != 200) {
-                        std::string msg = http_res
-                            ? "Source returned HTTP " + std::to_string(http_res->status)
-                            : "Failed to connect to source: " + host;
-                        send_error(task, msg, ERROR_TYPE_SERVER);
+
+                    size_t n_tokens = 0;
+                    size_t n_bytes  = 0;
+                    const std::string err = pull_slot_state(*slot, task.slot_action.source_url,
+                                                            task.slot_action.source_slot, n_tokens, n_bytes);
+                    if (!err.empty()) {
+                        send_error(task, err, ERROR_TYPE_SERVER);
                         break;
                     }
 
-                    // Write response bytes to a temp file and restore via load_file
-                    // (matches the llama_state_seq_save_file format with magic header)
-                    const std::string tmp_path = std::filesystem::temp_directory_path().string()
-                        + "/llama_pull_tmp_" + std::to_string(id_slot) + ".bin";
-                    {
-                        std::ofstream f(tmp_path, std::ios::binary);
-                        f.write(http_res->body.data(), (std::streamsize)http_res->body.size());
-                    }
-
-                    llama_tokens tokens;
-                    tokens.resize(slot->n_ctx);
-                    size_t token_count = 0;
-                    size_t nread = llama_state_seq_load_file(ctx_tgt, tmp_path.c_str(), slot->id,
-                                                             tokens.data(), tokens.size(), &token_count);
-                    std::filesystem::remove(tmp_path);
-
-                    if (nread == 0) {
-                        slot->prompt.tokens.clear();
-                        send_error(task, "Failed to restore slot state: no available KV space or incompatible state file", ERROR_TYPE_SERVER);
-                        break;
-                    }
-                    tokens.resize(token_count);
-                    slot->prompt.tokens.clear();
-                    slot->prompt.tokens.insert(tokens);
-
-                    const int64_t t_end = ggml_time_us();
-                    const double t_ms = (t_end - t_start) / 1000.0;
+                    const double t_ms = (ggml_time_us() - t_start) / 1000.0;
 
                     auto res = std::make_unique<server_task_result_slot_save_load>();
                     res->id       = task.id;
                     res->id_slot  = id_slot;
                     res->filename = "";
                     res->is_save  = false;
-                    res->n_tokens = token_count;
-                    res->n_bytes  = nread;
+                    res->n_tokens = n_tokens;
+                    res->n_bytes  = n_bytes;
                     res->t_ms     = t_ms;
                     queue_results.send(std::move(res));
                 } break;
@@ -2640,6 +2729,21 @@ private:
                                 if (slot.alora_invocation_start > 0) {
                                     SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
                                     n_past = std::min(n_past, slot.alora_invocation_start - 1);
+                                }
+
+                                // disaggregated prefill: offload the prompt processing of large
+                                // uncached prompts to the remote prefill server and pull the
+                                // computed state back (--prefill-url). blocks the server loop
+                                // while it runs — fine at -np 1, revisit for multi-slot.
+                                if (!params_base.prefill_url.empty() &&
+                                    mctx == nullptr &&
+                                    !input_tokens.has_mtmd &&
+                                    slot.alora_invocation_start <= 0 &&
+                                    slot.task->n_tokens() - n_past >= params_base.prefill_min_tokens) {
+                                    disagg_remote_prefill(slot);
+                                    // recompute in both cases: on success the prefix is N-4; on
+                                    // failure the slot may have been cleared -> 0 (local prefill)
+                                    n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
                                 }
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;

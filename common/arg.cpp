@@ -3045,6 +3045,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--prefill-url"}, "URL",
+        "remote llama-server for disaggregated prefill: prompts with enough uncached tokens are "
+        "prefilled there (/completion with exact token IDs) and the state is pulled back "
+        "(default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.prefill_url = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefill-state-url"}, "URL",
+        "where to GET /slots/:id/state for disaggregated prefill — the prefill server itself, or a "
+        "prefill_shim.py next to an old build (default: --prefill-url)",
+        [](common_params & params, const std::string & value) {
+            params.prefill_state_url = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefill-min-tokens"}, "N",
+        string_format("offload prefill only when at least this many prompt tokens are uncached (default: %d)", params.prefill_min_tokens),
+        [](common_params & params, int value) {
+            params.prefill_min_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
         [](common_params & params, const std::string & value) {
