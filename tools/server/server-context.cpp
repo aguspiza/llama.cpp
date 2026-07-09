@@ -4604,11 +4604,6 @@ void server_routes::init_routes() {
 
     this->get_slots_state = [this](const server_http_req & req) {
         auto res = create_response();
-        if (params.slot_save_path.empty()) {
-            res->error(format_error_response("This server does not support slot state endpoint. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
-            return res;
-        }
-
         std::string id_slot_str = req.get_param("id_slot");
         int id_slot;
         try {
@@ -4636,9 +4631,12 @@ void server_routes::init_routes() {
 
         std::string action = req.get_param("action");
 
-        // pull does not use slot_save_path — check it first
+        // pull and erase do not use slot_save_path — check them first
         if (action == "pull") {
             return handle_slots_pull(req, id_slot);
+        }
+        if (action == "erase") {
+            return handle_slots_erase(req, id_slot);
         }
 
         if (params.slot_save_path.empty()) {
@@ -4651,9 +4649,6 @@ void server_routes::init_routes() {
         }
         if (action == "restore") {
             return handle_slots_restore(req, id_slot);
-        }
-        if (action == "erase") {
-            return handle_slots_erase(req, id_slot);
         }
 
         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
@@ -5344,7 +5339,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_get_state(cons
         task.id = rd.get_new_id();
         task.slot_action.id_slot  = id_slot;
         // pass temp path via filepath field so the task handler (which has no params access) can use it
-        task.slot_action.filepath = params.slot_save_path + "_state_tmp_" + std::to_string(id_slot) + ".bin";
+        task.slot_action.filepath = std::filesystem::temp_directory_path().string()
+            + "/llama_state_tmp_" + std::to_string(id_slot) + ".bin";
         rd.post_task(std::move(task));
     }
 
