@@ -2139,20 +2139,25 @@ private:
         cli.set_connection_timeout(10);
         cli.set_read_timeout(600);
 
-        // 1) always erase the remote slot first: stale KV + recurrent/SSM state from a
-        //    previous request corrupts the prefill if reused
-        auto res_erase = cli.Post("/slots/" + std::to_string(source_slot) + "?action=erase");
-        if (!res_erase || res_erase->status != 200) {
-            SLT_WRN(slot, "disagg: remote erase failed (HTTP %d), falling back to local prefill\n",
-                    res_erase ? res_erase->status : -1);
-            return false;
+        // 1) erase the remote slot first: stale KV + recurrent/SSM state from a previous
+        //    request corrupts the prefill if reused. with --prefill-cache we skip the
+        //    erase and let the remote reuse its prompt cache instead — safe only because
+        //    we send exact token IDs, so its prefix match is byte-exact and the hybrid
+        //    checkpoint logic rolls the recurrent state back to a valid checkpoint.
+        if (!params_base.prefill_cache) {
+            auto res_erase = cli.Post("/slots/" + std::to_string(source_slot) + "?action=erase");
+            if (!res_erase || res_erase->status != 200) {
+                SLT_WRN(slot, "disagg: remote erase failed (HTTP %d), falling back to local prefill\n",
+                        res_erase ? res_erase->status : -1);
+                return false;
+            }
         }
 
         // 2) prefill the exact token IDs remotely
         const json body = {
             {"prompt",       ids},
             {"n_predict",    0},
-            {"cache_prompt", false},
+            {"cache_prompt", params_base.prefill_cache},
             {"id_slot",      source_slot},
             {"stream",       false},
         };
@@ -2161,6 +2166,15 @@ private:
             SLT_WRN(slot, "disagg: remote prefill failed (HTTP %d), falling back to local prefill\n",
                     res_pf ? res_pf->status : -1);
             return false;
+        }
+
+        // how much the remote actually had to process (with --prefill-cache this
+        // shrinks to the uncached suffix on follow-up turns)
+        int remote_prompt_n = -1;
+        try {
+            remote_prompt_n = json::parse(res_pf->body).at("timings").value("prompt_n", -1);
+        } catch (const std::exception &) {
+            // remote response without timings — log -1
         }
 
         // 3) pull the computed state into this slot
@@ -2174,8 +2188,8 @@ private:
             return false;
         }
 
-        SLT_INF(slot, "disagg: remote prefill of %zu tokens pulled in %.2f s (%zu bytes)\n",
-                n_tokens, (ggml_time_us() - t_start) / 1e6, n_bytes);
+        SLT_INF(slot, "disagg: remote prefill of %zu tokens (remote processed %d) pulled in %.2f s (%zu bytes)\n",
+                n_tokens, remote_prompt_n, (ggml_time_us() - t_start) / 1e6, n_bytes);
         return true;
     }
 
