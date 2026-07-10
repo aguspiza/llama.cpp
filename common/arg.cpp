@@ -3069,6 +3069,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--prefill-cache"},
+        string_format("let the remote prefill server reuse its prompt cache instead of erasing its "
+                      "slot each time, so it only processes the uncached suffix (default: %s)",
+                      params.prefill_cache ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.prefill_cache = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
         [](common_params & params, const std::string & value) {
