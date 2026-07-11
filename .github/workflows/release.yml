@@ -487,7 +487,8 @@ jobs:
       - name: Pack artifacts
         id: pack_artifacts
         run: |
-          Copy-Item "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC\14.44.35112\debug_nonredist\${{ matrix.arch }}\Microsoft.VC143.OpenMP.LLVM\libomp140.${{ matrix.arch == 'x64' && 'x86_64' || 'aarch64' }}.dll" .\build\bin\Release\
+          $omp = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC\*\debug_nonredist\${{ matrix.arch }}\Microsoft.VC143.OpenMP.LLVM\libomp140.${{ matrix.arch == 'x64' && 'x86_64' || 'aarch64' }}.dll" | Select-Object -First 1
+          Copy-Item $omp.FullName .\build\bin\Release\
           7z a -snl llama-bin-win-cpu-${{ matrix.arch }}.zip .\build\bin\Release\*
 
       - name: Upload artifacts
