@@ -2088,8 +2088,10 @@ private:
             f.write(http_res->body.data(), (std::streamsize) http_res->body.size());
         }
 
-        // start from a clean sequence: load_file does not clear pre-existing cells
+        // start from a clean sequence: load_file does not clear pre-existing cells,
+        // and stale checkpoints would reference the KV we are about to replace
         slot.prompt_clear(true);
+        slot.prompt.checkpoints.clear();
 
         llama_tokens tokens;
         tokens.resize(slot.n_ctx);
@@ -3363,21 +3365,6 @@ private:
                                     n_past = std::min(n_past, slot.alora_invocation_start - 1);
                                 }
 
-                                // disaggregated prefill: offload the prompt processing of large
-                                // uncached prompts to the remote prefill server and pull the
-                                // computed state back (--prefill-url). blocks the server loop
-                                // while it runs — fine at -np 1, revisit for multi-slot.
-                                if (!params_base.prefill_url.empty() &&
-                                    mctx == nullptr &&
-                                    !input_tokens.has_mtmd &&
-                                    slot.alora_invocation_start <= 0 &&
-                                    slot.task->n_tokens() - n_past >= params_base.prefill_min_tokens) {
-                                    disagg_remote_prefill(slot);
-                                    // recompute in both cases: on success the prefix is N-4; on
-                                    // failure the slot may have been cleared -> 0 (local prefill)
-                                    n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
-                                }
-
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
                                 const bool can_cache_reuse =
@@ -3555,6 +3542,28 @@ private:
                                         ++it;
                                     }
                                 }
+                            }
+                        }
+
+                        // disaggregated prefill: offload the prompt processing of large
+                        // uncached prompts to the remote prefill server and pull the
+                        // computed state back (--prefill-url). runs AFTER the checkpoint
+                        // logic so the gate sees the true reusable prefix — for
+                        // hybrid/recurrent models a mid-sequence divergence without a
+                        // covering checkpoint resets n_past to 0 (full re-processing),
+                        // which is exactly when offloading pays off most. blocks the
+                        // server loop while it runs — fine at -np 1, revisit for multi-slot.
+                        if (!params_base.prefill_url.empty() &&
+                            mctx == nullptr &&
+                            !input_tokens.has_mtmd &&
+                            slot.alora_invocation_start <= 0 &&
+                            slot.task->n_tokens() - n_past >= params_base.prefill_min_tokens) {
+                            if (disagg_remote_prefill(slot)) {
+                                n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                            } else {
+                                // failure may have cleared the slot — never keep an n_past
+                                // larger than what the slot actually holds
+                                n_past = std::min<int>(n_past, slot.prompt.tokens.get_common_prefix(input_tokens));
                             }
                         }
 
