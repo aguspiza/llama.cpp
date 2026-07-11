@@ -441,6 +441,7 @@ jobs:
     runs-on: windows-2025
 
     strategy:
+      fail-fast: false # arm64 fails on this base; don't cancel the x64 build we need
       matrix:
         include:
           - arch: 'x64'
