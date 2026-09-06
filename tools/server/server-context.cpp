@@ -42,6 +42,105 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// context checkpoints are what makes prefix reuse possible on hybrid/recurrent
+// models: without one covering the reusable prefix the server resets n_past to 0
+// and reprocesses the whole prompt. llama_state_seq_save_file persists the KV but
+// not the checkpoint list, so a restored slot would always pay a full prefill.
+// these two write/read the list alongside the slot file, as "<slot file>.ckpt".
+static const uint32_t CKPT_MAGIC   = 0x504b434c; // "LCKP"
+static const uint32_t CKPT_VERSION = 1;
+
+static void ckpt_write_blob(std::ofstream & f, const std::vector<uint8_t> & blob) {
+    const uint64_t n = blob.size();
+    f.write(reinterpret_cast<const char *>(&n), sizeof(n));
+    if (n > 0) {
+        f.write(reinterpret_cast<const char *>(blob.data()), (std::streamsize) n);
+    }
+}
+
+static bool ckpt_read_blob(std::ifstream & f, std::vector<uint8_t> & blob) {
+    uint64_t n = 0;
+    if (!f.read(reinterpret_cast<char *>(&n), sizeof(n))) {
+        return false;
+    }
+    blob.resize(n);
+    return n == 0 || (bool) f.read(reinterpret_cast<char *>(blob.data()), (std::streamsize) n);
+}
+
+static size_t save_prompt_checkpoints(const std::string & path, const std::list<common_prompt_checkpoint> & cps) {
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        return 0;
+    }
+
+    const uint32_t count = (uint32_t) cps.size();
+    f.write(reinterpret_cast<const char *>(&CKPT_MAGIC),   sizeof(CKPT_MAGIC));
+    f.write(reinterpret_cast<const char *>(&CKPT_VERSION), sizeof(CKPT_VERSION));
+    f.write(reinterpret_cast<const char *>(&count),        sizeof(count));
+
+    for (const auto & cp : cps) {
+        const int64_t   n_tokens = cp.n_tokens;
+        const llama_pos pos_min  = cp.pos_min;
+        const llama_pos pos_max  = cp.pos_max;
+
+        f.write(reinterpret_cast<const char *>(&n_tokens), sizeof(n_tokens));
+        f.write(reinterpret_cast<const char *>(&pos_min),  sizeof(pos_min));
+        f.write(reinterpret_cast<const char *>(&pos_max),  sizeof(pos_max));
+
+        ckpt_write_blob(f, cp.data_tgt);
+        ckpt_write_blob(f, cp.data_dft);
+        ckpt_write_blob(f, cp.data_spec);
+    }
+
+    if (!f) {
+        return 0;
+    }
+
+    return (size_t) f.tellp();
+}
+
+// returns the number of checkpoints read; 0 also covers "no sidecar file", which is
+// the normal case for slot files written before this existed.
+static size_t load_prompt_checkpoints(const std::string & path, std::list<common_prompt_checkpoint> & cps) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        return 0;
+    }
+
+    uint32_t magic = 0, version = 0, count = 0;
+    if (!f.read(reinterpret_cast<char *>(&magic),   sizeof(magic))   ||
+        !f.read(reinterpret_cast<char *>(&version), sizeof(version)) ||
+        !f.read(reinterpret_cast<char *>(&count),   sizeof(count))) {
+        return 0;
+    }
+
+    if (magic != CKPT_MAGIC || version != CKPT_VERSION) {
+        return 0;
+    }
+
+    std::list<common_prompt_checkpoint> out;
+    for (uint32_t i = 0; i < count; i++) {
+        common_prompt_checkpoint cp;
+        if (!f.read(reinterpret_cast<char *>(&cp.n_tokens), sizeof(cp.n_tokens)) ||
+            !f.read(reinterpret_cast<char *>(&cp.pos_min),  sizeof(cp.pos_min))  ||
+            !f.read(reinterpret_cast<char *>(&cp.pos_max),  sizeof(cp.pos_max))) {
+            return 0;
+        }
+
+        if (!ckpt_read_blob(f, cp.data_tgt) ||
+            !ckpt_read_blob(f, cp.data_dft) ||
+            !ckpt_read_blob(f, cp.data_spec)) {
+            return 0;
+        }
+
+        out.push_back(std::move(cp));
+    }
+
+    cps = std::move(out);
+
+    return cps.size();
+}
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -2116,7 +2215,7 @@ private:
 
         // start from a clean sequence: load_file does not clear pre-existing cells,
         // and stale checkpoints would reference the KV we are about to replace
-        slot.prompt_clear(true);
+        slot.prompt_clear();
         slot.prompt.checkpoints.clear();
 
         llama_tokens tokens;
@@ -2743,6 +2842,12 @@ private:
 
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
+                    // persist the context checkpoints too: without them a restored slot
+                    // cannot reuse any prefix on hybrid/recurrent models
+                    const size_t n_ckpt_saved = save_prompt_checkpoints(filepath + ".ckpt", slot->prompt.checkpoints);
+                    SLT_INF(*slot, "saved %zu context checkpoint(s) alongside '%s' (%zu bytes)\n",
+                            slot->prompt.checkpoints.size(), filename.c_str(), n_ckpt_saved);
+
 
                     auto res = std::make_unique<server_task_result_slot_save_load>();
                     res->id       = task.id;
@@ -2830,6 +2935,16 @@ private:
 
                     SLT_INF(*slot, "restored %zu tokens from '%s' for disaggregated decode, KV positions 0..%zu valid\n",
                             token_count, filename.c_str(), token_count > 0 ? token_count - 1 : 0);
+
+                    // repopulate the checkpoints saved with this slot: the prefill path
+                    // needs one covering the reusable prefix, otherwise it resets n_past
+                    // to 0 and reprocesses the whole prompt
+                    const size_t n_ckpt_loaded = load_prompt_checkpoints(filepath + ".ckpt", slot->prompt.checkpoints);
+                    if (n_ckpt_loaded > 0) {
+                        SLT_INF(*slot, "restored %zu context checkpoint(s) from '%s.ckpt'\n", n_ckpt_loaded, filename.c_str());
+                    } else {
+                        SLT_WRN(*slot, "no context checkpoints for '%s' - the next prompt will be fully reprocessed\n", filename.c_str());
+                    }
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
