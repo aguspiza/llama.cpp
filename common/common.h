@@ -690,6 +690,8 @@ struct common_params {
     bool log_json = false;
 
     std::string slot_save_path;
+    std::string slot_preload;  // file under slot_save_path, restored into slot 0 at startup
+    std::string slot_autosave; // file under slot_save_path, rewritten when slot 0 goes idle with a longer prompt
     std::string media_path; // path to directory for loading media files
 
     // disaggregated prefill: offload prompt processing to a remote llama-server

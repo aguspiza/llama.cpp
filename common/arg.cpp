@@ -3643,6 +3643,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--slot-preload"}, "FNAME",
+        "restore this slot file (under --slot-save-path) into slot 0 at startup, so the first "
+        "request does not pay the prefill (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.slot_preload = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_PRELOAD"));
+    add_opt(common_arg(
+        {"--slot-autosave"}, "FNAME",
+        "rewrite this slot file (under --slot-save-path) whenever slot 0 goes idle holding a "
+        "longer prompt than the one already on disk (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.slot_autosave = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_AUTOSAVE"));
+    add_opt(common_arg(
         {"--prefill-url"}, "URL",
         "remote llama-server for disaggregated prefill: prompts with enough uncached tokens are "
         "prefilled there (/completion with exact token IDs) and the state is pulled back "

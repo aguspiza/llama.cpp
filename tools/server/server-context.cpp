@@ -1015,6 +1015,10 @@ private:
 
     int n_empty_consecutive = 0;
 
+    // --slot-autosave: prompt length already written to disk, so an idle slot is only
+    // re-saved when it actually has more prefix to offer than the file already holds
+    size_t autosave_n_tokens = 0;
+
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     server_metrics metrics;
@@ -2702,6 +2706,26 @@ private:
                                 if (slot.prompt_save(*prompt_cache)) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
+                                }
+
+                                // --slot-autosave: persist the idle prefix so the next server
+                                // start can preload it. only slot 0, and only when it holds
+                                // more than the file already on disk.
+                                if (!params_base.slot_autosave.empty() &&
+                                    !params_base.slot_save_path.empty() &&
+                                    slot.id == 0 &&
+                                    slot.prompt.tokens.size() > autosave_n_tokens) {
+                                    autosave_n_tokens = slot.prompt.tokens.size();
+
+                                    server_task save(SERVER_TASK_TYPE_SLOT_SAVE);
+                                    save.id = queue_tasks.get_new_id();
+                                    save.slot_action.id_slot  = slot.id;
+                                    save.slot_action.filename = params_base.slot_autosave;
+                                    save.slot_action.filepath = params_base.slot_save_path + params_base.slot_autosave;
+                                    queue_tasks.post(std::move(save));
+
+                                    SLT_INF(slot, "autosaving %zu tokens to '%s'\n",
+                                            autosave_n_tokens, params_base.slot_autosave.c_str());
                                 }
 
                                 if (params_base.kv_unified) {
@@ -4565,6 +4589,20 @@ bool server_context::load_model(common_params & params) {
 
 void server_context::start_loop() {
     auto & params = impl->params_base;
+
+    // --slot-preload: queue the restore ahead of everything else, so the first real
+    // request finds the prefix already in the KV instead of prefilling it again
+    if (!params.slot_preload.empty() && !params.slot_save_path.empty()) {
+        server_task task(SERVER_TASK_TYPE_SLOT_RESTORE);
+        task.id = impl->queue_tasks.get_new_id();
+        task.slot_action.id_slot  = 0;
+        task.slot_action.filename = params.slot_preload;
+        task.slot_action.filepath = params.slot_save_path + params.slot_preload;
+        impl->queue_tasks.post(std::move(task), true);
+
+        SRV_INF("preloading slot 0 from '%s'\n", params.slot_preload.c_str());
+    }
+
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
 }
 
