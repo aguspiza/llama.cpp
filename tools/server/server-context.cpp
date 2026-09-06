@@ -2708,26 +2708,6 @@ private:
                                     prompt_cache->update();
                                 }
 
-                                // --slot-autosave: persist the idle prefix so the next server
-                                // start can preload it. only slot 0, and only when it holds
-                                // more than the file already on disk.
-                                if (!params_base.slot_autosave.empty() &&
-                                    !params_base.slot_save_path.empty() &&
-                                    slot.id == 0 &&
-                                    slot.prompt.tokens.size() > autosave_n_tokens) {
-                                    autosave_n_tokens = slot.prompt.tokens.size();
-
-                                    server_task save(SERVER_TASK_TYPE_SLOT_SAVE);
-                                    save.id = queue_tasks.get_new_id();
-                                    save.slot_action.id_slot  = slot.id;
-                                    save.slot_action.filename = params_base.slot_autosave;
-                                    save.slot_action.filepath = params_base.slot_save_path + params_base.slot_autosave;
-                                    queue_tasks.post(std::move(save));
-
-                                    SLT_INF(slot, "autosaving %zu tokens to '%s'\n",
-                                            autosave_n_tokens, params_base.slot_autosave.c_str());
-                                }
-
                                 if (params_base.kv_unified) {
                                     // [TAG_IDLE_SLOT_CLEAR]
                                     slot.prompt_clear();
@@ -3221,6 +3201,26 @@ private:
 
             if (all_idle) {
                 SRV_TRC("%s", "all slots are idle\n");
+
+                // --slot-autosave: the slot has finished and still holds its prefix, which is
+                // the moment worth persisting. not exit, which a hard kill never reaches, and
+                // not the idle-slot sweep, which with a single slot never sees it idle.
+                if (!params_base.slot_autosave.empty() &&
+                    !params_base.slot_save_path.empty() &&
+                    !slots.empty() &&
+                    slots[0].prompt.tokens.size() > autosave_n_tokens) {
+                    autosave_n_tokens = slots[0].prompt.tokens.size();
+
+                    server_task save(SERVER_TASK_TYPE_SLOT_SAVE);
+                    save.id = queue_tasks.get_new_id();
+                    save.slot_action.id_slot  = slots[0].id;
+                    save.slot_action.filename = params_base.slot_autosave;
+                    save.slot_action.filepath = params_base.slot_save_path + params_base.slot_autosave;
+                    queue_tasks.post(std::move(save));
+
+                    SRV_INF("autosaving %zu tokens to '%s'\n",
+                            autosave_n_tokens, params_base.slot_autosave.c_str());
+                }
 
                 metrics_flush_idle();
 
