@@ -732,6 +732,24 @@ struct server_slot {
         other.prompt = prompt.clone();
         other.init_sampler();
     }
+
+    // jev-mode: hand this slot's evaluated prefix to a child that still has its own suffix to
+    // evaluate. Unlike copy_state_to, the child keeps its own stats and i_batch and goes back to
+    // STARTED, so the ordinary prompt path finds the whole prefix cached and evaluates only the
+    // suffix -- and children activated together have their suffixes decoded in one batch.
+    //
+    // Must run after the prefix has been decoded: a prefix whose last chunk is still in the
+    // pending batch has no KV cells yet, and seq_cp would hand the child an incomplete prefix.
+    void share_prefix_with(server_slot & other) const {
+        GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
+        GGML_ASSERT(other.state == SLOT_STATE_WAIT_OTHER);
+
+        mem.seq_rm(other.id,     -1, -1);
+        mem.seq_cp(id, other.id, -1, -1);
+
+        other.prompt = prompt.clone();
+        other.state  = SLOT_STATE_STARTED;
+    }
 };
 
 // returns 0 on success
@@ -3787,8 +3805,9 @@ private:
         }
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
+        // (jev-mode parents are left alone: their children need the decoded prefix, see post_decode)
         for (auto & slot : slots) {
-            if (slot.state == SLOT_STATE_DONE_PROMPT && slot.task->is_parent()) {
+            if (slot.state == SLOT_STATE_DONE_PROMPT && slot.task->is_parent() && !slot.task->params.jev_fanout) {
                 std::vector<server_slot *> children;
                 for (auto & other : slots) {
                     if (other.state == SLOT_STATE_WAIT_OTHER && slot.task->id == other.task->id_parent) {
@@ -3863,6 +3882,17 @@ private:
                 }
 
                 GGML_ASSERT(slot.task->need_sampling());
+
+                // jev-mode: the shared prefix is decoded now, so hand it to every child; they
+                // evaluate their suffixes together in the next batch
+                if (slot.task->is_parent() && slot.task->params.jev_fanout) {
+                    for (auto & other : slots) {
+                        if (other.state == SLOT_STATE_WAIT_OTHER && other.task->id_parent == slot.task->id) {
+                            SLT_TRC(slot, " - sharing prefix with jev child %d\n", other.id);
+                            slot.share_prefix_with(other);
+                        }
+                    }
+                }
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
@@ -5258,10 +5288,23 @@ void server_routes::init_routes() {
     // jev-mode fan-out: one shared prefix, N questions, one option distribution per question.
     //
     // Each question is an ordinary completion task (prefix + its suffix, n_predict = 1,
-    // jev_options = its options), so prompt caching, sampler setup and slot handling are exactly
-    // those of /completion. Pinning every task to one slot is what makes the prefix be evaluated
-    // once: the first task pays for it, and each later task reuses the cached prefix and
-    // evaluates only its own suffix.
+    // jev_options = its options), so prompt caching, sampler setup and slot handling are those of
+    // /completion. The prefix is evaluated once either way; how the suffixes run depends on the
+    // number of slots:
+    //
+    //  - batched, when n_parallel >= N + 1: a parent task evaluates the prefix alone and hands it
+    //    to N child slots (share_prefix_with), which evaluate their suffixes together in one batch.
+    //    The parent's own result is dropped.
+    //  - sequential otherwise: every question is pinned to one slot; the first pays for the
+    //    prefix, and each later one reuses it from the cache and evaluates only its suffix.
+    //
+    // Sequential is a fallback rather than an error because the scheduler defers a parent until
+    // all its child slots are free: with fewer than N + 1 slots it would wait forever.
+    //
+    // Batched mode wants --kv-unified. There, children share the prefix's KV cells; without it
+    // every child gets a physical copy of its stream buffer and the suffixes decode across N
+    // streams. Measured on CPU, 9 questions over a 1,700-token prefix (Qwen2.5-0.5B Q8_0): the
+    // suffix phase took ~2,000 ms sequential, ~2,200 ms batched per-slot, ~855 ms batched unified.
     this->post_jev = [this](const server_http_req & req) {
         auto res = create_response();
 
@@ -5277,6 +5320,7 @@ void server_routes::init_routes() {
         }
         const json & questions = body.at("questions");
         const int    id_slot   = json_value(body, "id_slot", 0);
+        const bool   batched   = (int) questions.size() + 1 <= params.n_parallel;
 
         auto & rd = res->rd;
         try {
@@ -5284,10 +5328,14 @@ void server_routes::init_routes() {
             // tokenizing prefix + suffix as one string can merge tokens across the boundary and
             // break the prefix match that the cache reuse depends on
             const llama_tokens prefix = common_tokenize(ctx_server.vocab, body.at("prefix").get<std::string>(), true, true);
+            if (prefix.empty()) {
+                // an empty prompt releases its slot without reaching DONE_PROMPT, which would
+                // leave batched children waiting forever
+                throw std::invalid_argument("\"prefix\" must not be empty");
+            }
 
-            std::vector<server_task> tasks;
-            tasks.reserve(questions.size());
-            for (size_t i = 0; i < questions.size(); i++) {
+            // the completion task for question i, without id or slot
+            auto question_task = [&](size_t i) {
                 const json & q = questions[i];
                 if (!q.is_object() || !q.contains("suffix") || !q.at("suffix").is_string() || !q.contains("options")) {
                     throw std::invalid_argument("questions[" + std::to_string(i) + "] needs a string \"suffix\" and an \"options\" array");
@@ -5305,11 +5353,37 @@ void server_routes::init_routes() {
                 };
 
                 server_task task = server_task(SERVER_TASK_TYPE_COMPLETION);
-                task.id      = rd.get_new_id();
-                task.tokens  = server_tokens(tokens, false);
-                task.params  = server_schema::eval_llama_cmpl_schema(ctx_server.vocab, params, meta->logit_bias_eog, data);
-                task.id_slot = id_slot;
-                tasks.push_back(std::move(task));
+                task.tokens = server_tokens(tokens, false);
+                task.params = server_schema::eval_llama_cmpl_schema(ctx_server.vocab, params, meta->logit_bias_eog, data);
+                return task;
+            };
+
+            std::vector<server_task> tasks;
+            if (batched) {
+                server_task parent = server_task(SERVER_TASK_TYPE_COMPLETION);
+                parent.id      = rd.get_new_id();
+                parent.tokens  = server_tokens(prefix, false);
+                parent.params  = server_schema::eval_llama_cmpl_schema(ctx_server.vocab, params, meta->logit_bias_eog,
+                                                                       json {{"n_predict", 1}, {"cache_prompt", true}});
+                parent.params.jev_fanout = true;
+                parent.id_slot = id_slot;
+                for (size_t i = 0; i < questions.size(); i++) {
+                    parent.add_child(parent.id, rd.get_new_id());
+                    // add_child copies the parent; each child carries its own question instead
+                    server_task q = question_task(i);
+                    server_task & child = parent.child_tasks.back();
+                    child.tokens = std::move(q.tokens);
+                    child.params = std::move(q.params);
+                }
+                tasks.push_back(std::move(parent));
+            } else {
+                tasks.reserve(questions.size());
+                for (size_t i = 0; i < questions.size(); i++) {
+                    server_task task = question_task(i);
+                    task.id      = rd.get_new_id();
+                    task.id_slot = id_slot;
+                    tasks.push_back(std::move(task));
+                }
             }
             rd.post_tasks(std::move(tasks));
         } catch (const std::exception & e) {
@@ -5327,9 +5401,11 @@ void server_routes::init_routes() {
         }
 
         // results arrive ordered by question, and each distribution is ordered like that
-        // question's "options", so both line up with the request by index
+        // question's "options", so both line up with the request by index. In batched mode
+        // index 0 is the parent, which only evaluated the prefix.
         json results = json::array();
-        for (auto & r : all_results.results) {
+        for (size_t i = batched ? 1 : 0; i < all_results.results.size(); i++) {
+            auto & r = all_results.results[i];
             auto * fin = dynamic_cast<server_task_result_cmpl_final *>(r.get());
             GGML_ASSERT(fin != nullptr);
 
@@ -5356,7 +5432,7 @@ void server_routes::init_routes() {
             });
         }
 
-        res->ok({{"results", results}});
+        res->ok({{"mode", batched ? "batched" : "sequential"}, {"results", results}});
         return res;
     };
 

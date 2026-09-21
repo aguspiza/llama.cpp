@@ -79,6 +79,10 @@ struct task_params {
     // the raw logits at the first generated position, instead of the top n_probs of the vocabulary
     std::vector<llama_token> jev_options;
 
+    // jev-mode, set by /jev on a parent that holds only the shared prefix: its children do not
+    // share its logits like n_cmpl children, they each evaluate their own suffix on top of it
+    bool jev_fanout = false;
+
     struct common_params_sampling sampling;
 
     // whether per-token probabilities are computed and returned at all
