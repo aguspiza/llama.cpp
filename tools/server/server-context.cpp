@@ -1787,7 +1787,11 @@ private:
                 return false;
             }
 
-            const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
+            // jev-mode reads arbitrary option tokens out of the logits, so it needs the full
+            // vocabulary, which backend sampling does not keep
+            const bool need_pre_sample_logits =
+                (task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs) ||
+                !task.params.jev_options.empty();
 
             bool use_backend_sampling = task.params.sampling.backend_sampling;
 
@@ -1961,7 +1965,50 @@ private:
         return slot.has_next_token; // continue
     }
 
+    // jev-mode: softmax over the raw logits of exactly the requested option tokens. No grammar is
+    // needed to restrict the answer, and none of the vocabulary is sorted, so this costs the same
+    // for 2 options as for 200.
+    void populate_jev_probs(const server_slot & slot, completion_token_output & result, bool special, int idx) const {
+        const auto & opts = slot.task->params.jev_options;
+
+        // jev_options forces need_pre_sample_logits, which disables backend sampling, so there is
+        // no compacted candidate list and the logits row covers the whole vocabulary, indexable by
+        // token id. (llama_get_sampled_candidates_ith is no test for this: despite its header
+        // comment it never returns NULL, it falls back to the full-vocabulary id list.)
+        GGML_ASSERT(llama_get_sampled_logits_count_ith(ctx_tgt, idx) == (uint32_t) llama_vocab_n_tokens(vocab));
+        const float * logits = llama_get_logits_ith(ctx_tgt, idx);
+        GGML_ASSERT(logits != nullptr);
+
+        float max_l = -std::numeric_limits<float>::infinity();
+        for (const llama_token tok : opts) {
+            max_l = std::max(max_l, logits[tok]);
+        }
+
+        std::vector<double> p(opts.size());
+        double sum = 0.0;
+        for (size_t i = 0; i < opts.size(); i++) {
+            p[i] = std::exp((double) logits[opts[i]] - max_l);
+            sum += p[i];
+        }
+
+        result.prob = 0.0f; // the sampled token may not be an option at all
+        result.probs.clear();
+        result.probs.reserve(opts.size());
+        for (size_t i = 0; i < opts.size(); i++) {
+            const float pi = (float) (p[i] / sum);
+            result.probs.push_back({ opts[i], common_token_to_piece(ctx_tgt, opts[i], special), pi });
+            if (opts[i] == result.tok) {
+                result.prob = pi;
+            }
+        }
+    }
+
     void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx) const {
+        if (!slot.task->params.jev_options.empty()) {
+            populate_jev_probs(slot, result, special, idx);
+            return;
+        }
+
         const size_t n_probs_request = slot.task->params.sampling.n_probs;
 
         if (post_sampling) {
@@ -2074,7 +2121,7 @@ private:
         res->oaicompat_cmpl_id = slot.task->params.oaicompat_cmpl_id;
 
         // populate res.probs_output
-        if (slot.task->params.sampling.n_probs > 0) {
+        if (slot.task->params.wants_token_probs()) {
             res->prob_output = tkn; // copy the token probs
         }
 
@@ -2129,7 +2176,7 @@ private:
         res->oaicompat_cmpl_id = slot.task->params.oaicompat_cmpl_id;
 
         // populate res.probs_output
-        if (slot.task->params.sampling.n_probs > 0) {
+        if (slot.task->params.wants_token_probs()) {
             if (!slot.task->params.stream && slot.stop == STOP_TYPE_WORD) {
                 const llama_tokens stop_word_toks = common_tokenize(ctx_tgt, slot.stopping_word, false);
 
@@ -3862,7 +3909,7 @@ private:
             result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
             result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
 
-            if (slot.task->params.sampling.n_probs > 0) {
+            if (slot.task->params.wants_token_probs()) {
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
             }
 
@@ -5205,6 +5252,111 @@ void server_routes::init_routes() {
             top_n);
 
         res->ok(root);
+        return res;
+    };
+
+    // jev-mode fan-out: one shared prefix, N questions, one option distribution per question.
+    //
+    // Each question is an ordinary completion task (prefix + its suffix, n_predict = 1,
+    // jev_options = its options), so prompt caching, sampler setup and slot handling are exactly
+    // those of /completion. Pinning every task to one slot is what makes the prefix be evaluated
+    // once: the first task pays for it, and each later task reuses the cached prefix and
+    // evaluates only its own suffix.
+    this->post_jev = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        const json body = json::parse(req.body);
+
+        if (!body.contains("prefix") || !body.at("prefix").is_string()) {
+            res->error(format_error_response("\"prefix\" must be a string", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (!body.contains("questions") || !body.at("questions").is_array() || body.at("questions").empty()) {
+            res->error(format_error_response("\"questions\" must be a non-empty array", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const json & questions = body.at("questions");
+        const int    id_slot   = json_value(body, "id_slot", 0);
+
+        auto & rd = res->rd;
+        try {
+            // tokenize the prefix once so every question carries byte-identical prefix tokens;
+            // tokenizing prefix + suffix as one string can merge tokens across the boundary and
+            // break the prefix match that the cache reuse depends on
+            const llama_tokens prefix = common_tokenize(ctx_server.vocab, body.at("prefix").get<std::string>(), true, true);
+
+            std::vector<server_task> tasks;
+            tasks.reserve(questions.size());
+            for (size_t i = 0; i < questions.size(); i++) {
+                const json & q = questions[i];
+                if (!q.is_object() || !q.contains("suffix") || !q.at("suffix").is_string() || !q.contains("options")) {
+                    throw std::invalid_argument("questions[" + std::to_string(i) + "] needs a string \"suffix\" and an \"options\" array");
+                }
+
+                llama_tokens tokens = prefix;
+                const llama_tokens suffix = common_tokenize(ctx_server.vocab, q.at("suffix").get<std::string>(), false, true);
+                tokens.insert(tokens.end(), suffix.begin(), suffix.end());
+
+                const json data = {
+                    {"n_predict",           1},
+                    {"cache_prompt",        true},
+                    {"post_sampling_probs", true}, // report probabilities rather than log-probabilities
+                    {"jev_options",         q.at("options")},
+                };
+
+                server_task task = server_task(SERVER_TASK_TYPE_COMPLETION);
+                task.id      = rd.get_new_id();
+                task.tokens  = server_tokens(tokens, false);
+                task.params  = server_schema::eval_llama_cmpl_schema(ctx_server.vocab, params, meta->logit_bias_eog, data);
+                task.id_slot = id_slot;
+                tasks.push_back(std::move(task));
+            }
+            rd.post_tasks(std::move(tasks));
+        } catch (const std::exception & e) {
+            res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        auto all_results = rd.wait_for_all(req.should_stop);
+        if (all_results.is_terminated) {
+            return res; // connection is closed
+        }
+        if (all_results.error) {
+            res->error(all_results.error->to_json());
+            return res;
+        }
+
+        // results arrive ordered by question, and each distribution is ordered like that
+        // question's "options", so both line up with the request by index
+        json results = json::array();
+        for (auto & r : all_results.results) {
+            auto * fin = dynamic_cast<server_task_result_cmpl_final *>(r.get());
+            GGML_ASSERT(fin != nullptr);
+
+            json probs  = json::array();
+            int  choice = -1;
+            float best  = -1.0f;
+            if (!fin->probs_output.empty()) {
+                const auto & opts = fin->probs_output[0].probs;
+                for (size_t k = 0; k < opts.size(); k++) {
+                    probs.push_back(opts[k].prob);
+                    if (opts[k].prob > best) {
+                        best   = opts[k].prob;
+                        choice = (int) k;
+                    }
+                }
+            }
+
+            results.push_back({
+                {"choice",                 choice},
+                {"probs",                  probs},
+                {"n_prompt_tokens",        fin->n_prompt_tokens},
+                {"n_prompt_tokens_cached", fin->n_prompt_tokens_cache},
+                {"t_prompt_ms",            (fin->stats.t_prompt_last - fin->stats.t_start) / 1e3},
+            });
+        }
+
+        res->ok({{"results", results}});
         return res;
     };
 

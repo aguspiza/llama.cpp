@@ -2,6 +2,8 @@
 
 #include "json-schema-to-grammar.h"
 
+#include <algorithm>
+
 namespace server_schema {
 
 //
@@ -189,6 +191,42 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
 
     add((new field_bool("post_sampling_probs", params.post_sampling_probs))
         ->set_desc("Return probabilities of top n_probs tokens after applying the sampling chain"));
+
+    add((new field_json("jev_options"))
+        ->set_desc("jev-mode: return a probability distribution over exactly these tokens, softmaxed from the raw logits at the first generated position, instead of the top n_probs of the vocabulary. Each entry is a token id or a string that tokenizes to exactly one token. post_sampling_probs only selects whether they are reported as probabilities or log-probabilities")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            GGML_ASSERT(ctx.vocab != nullptr);
+            ctx.params.jev_options.clear();
+            const auto & opts = data.at("jev_options");
+            if (!opts.is_array() || opts.size() < 2) {
+                throw std::invalid_argument("\"jev_options\" must be an array of at least 2 tokens");
+            }
+            const int n_vocab = llama_vocab_n_tokens(ctx.vocab);
+            for (const auto & el : opts) {
+                llama_token tok;
+                if (el.is_number_integer()) {
+                    tok = el.get<llama_token>();
+                    if (tok < 0 || tok >= n_vocab) {
+                        throw std::invalid_argument("\"jev_options\": token id " + std::to_string(tok) + " is out of range");
+                    }
+                } else if (el.is_string()) {
+                    // an option that is not a single token would silently misalign the returned
+                    // distribution with the caller's options, so reject it instead of skipping it
+                    const auto toks = common_tokenize(ctx.vocab, el.get<std::string>(), false, true);
+                    if (toks.size() != 1) {
+                        throw std::invalid_argument("\"jev_options\": \"" + el.get<std::string>() +
+                            "\" must tokenize to exactly one token, got " + std::to_string(toks.size()));
+                    }
+                    tok = toks[0];
+                } else {
+                    throw std::invalid_argument("\"jev_options\" entries must be token ids or strings");
+                }
+                if (std::find(ctx.params.jev_options.begin(), ctx.params.jev_options.end(), tok) != ctx.params.jev_options.end()) {
+                    throw std::invalid_argument("\"jev_options\": token " + std::to_string(tok) + " appears twice");
+                }
+                ctx.params.jev_options.push_back(tok);
+            }
+        }));
 
     //
     // Speculative decoding params

@@ -75,7 +75,17 @@ struct task_params {
     bool timings_per_token   = false;
     bool post_sampling_probs = false;
 
+    // jev-mode: when non-empty, report a distribution over exactly these tokens, softmaxed from
+    // the raw logits at the first generated position, instead of the top n_probs of the vocabulary
+    std::vector<llama_token> jev_options;
+
     struct common_params_sampling sampling;
+
+    // whether per-token probabilities are computed and returned at all
+    bool wants_token_probs() const {
+        return sampling.n_probs > 0 || !jev_options.empty();
+    }
+
     struct common_params_speculative speculative;
 
     // response formatting
